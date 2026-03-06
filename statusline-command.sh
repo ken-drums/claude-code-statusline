@@ -72,12 +72,12 @@ if [ "$lines_added" -gt 0 ] 2>/dev/null || [ "$lines_removed" -gt 0 ] 2>/dev/nul
   git_stats="+${lines_added}/-${lines_removed}"
 fi
 
-# ---------- Usage API (cached 360s) ----------
+# ---------- Rate limit via Haiku probe (cached 360s) ----------
 CACHE_FILE="/tmp/claude-usage-cache.json"
 CACHE_TTL=360
-FIVE_HOUR_PCT=""
+FIVE_HOUR_UTIL=""
 FIVE_HOUR_RESET=""
-SEVEN_DAY_PCT=""
+SEVEN_DAY_UTIL=""
 SEVEN_DAY_RESET=""
 
 fetch_usage() {
@@ -93,32 +93,45 @@ fetch_usage() {
   fi
   [ -z "$access_token" ] && return 1
 
-  local response http_code
-  response=$(curl -s --max-time 5 -w '\n%{http_code}' \
+  # Tiny Haiku call (max_tokens=1) to get rate limit response headers
+  # -si includes headers in output; -D- writes headers to stdout
+  local full_response
+  full_response=$(curl -sD- --max-time 8 -o /dev/null \
     -H "Authorization: Bearer ${access_token}" \
     -H "Content-Type: application/json" \
     -H "User-Agent: claude-code/${cc_version:-0.0.0}" \
-    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || true)
-  [ -z "$response" ] && return 1
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "anthropic-version: 2023-06-01" \
+    -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"h"}]}' \
+    "https://api.anthropic.com/v1/messages" 2>/dev/null || true)
+  local headers="$full_response"
+  [ -z "$headers" ] && return 1
 
-  http_code=$(echo "$response" | tail -1)
-  local body
-  body=$(echo "$response" | sed '$d')
+  # Parse rate limit headers
+  local h5_util h5_reset h7_util h7_reset
+  h5_util=$(echo "$headers" | grep -i 'anthropic-ratelimit-unified-5h-utilization' | tr -d '\r' | awk '{print $2}')
+  h5_reset=$(echo "$headers" | grep -i 'anthropic-ratelimit-unified-5h-reset' | tr -d '\r' | awk '{print $2}')
+  h7_util=$(echo "$headers" | grep -i 'anthropic-ratelimit-unified-7d-utilization' | tr -d '\r' | awk '{print $2}')
+  h7_reset=$(echo "$headers" | grep -i 'anthropic-ratelimit-unified-7d-reset' | tr -d '\r' | awk '{print $2}')
 
-  if [ "$http_code" = "200" ] && echo "$body" | jq -e . >/dev/null 2>&1; then
-    echo "$body" > "$CACHE_FILE"
-    return 0
-  fi
-  return 1
+  [ -z "$h5_util" ] && return 1
+
+  # Save to cache as JSON
+  jq -n \
+    --arg h5u "$h5_util" --arg h5r "$h5_reset" \
+    --arg h7u "$h7_util" --arg h7r "$h7_reset" \
+    '{five_hour_util: $h5u, five_hour_reset: $h5r, seven_day_util: $h7u, seven_day_reset: $h7r}' \
+    > "$CACHE_FILE"
+  return 0
 }
 
 load_usage() {
   local data="$1"
   eval "$(echo "$data" | jq -r '
-    "FIVE_HOUR_PCT=" + (.five_hour.utilization // empty | tostring),
-    "FIVE_HOUR_RESET=" + (.five_hour.reset_at // empty | @sh),
-    "SEVEN_DAY_PCT=" + (.seven_day.utilization // empty | tostring),
-    "SEVEN_DAY_RESET=" + (.seven_day.reset_at // empty | @sh)
+    "FIVE_HOUR_UTIL=" + (.five_hour_util // empty),
+    "FIVE_HOUR_RESET=" + (.five_hour_reset // empty),
+    "SEVEN_DAY_UTIL=" + (.seven_day_util // empty),
+    "SEVEN_DAY_RESET=" + (.seven_day_reset // empty)
   ' 2>/dev/null)"
 }
 
@@ -144,42 +157,35 @@ fi
 # Convert utilization (0.0-1.0) to percentage
 to_pct() {
   local val="$1"
-  if [ -z "$val" ] || [ "$val" = "null" ]; then
+  if [ -z "$val" ] || [ "$val" = "null" ] || [ "$val" = "0" ]; then
     echo ""
     return
   fi
   awk "BEGIN{printf \"%.0f\", $val * 100}" 2>/dev/null || echo ""
 }
 
-FIVE_HOUR_PCT_DISPLAY=$(to_pct "$FIVE_HOUR_PCT")
-SEVEN_DAY_PCT_DISPLAY=$(to_pct "$SEVEN_DAY_PCT")
+FIVE_HOUR_PCT=$(to_pct "$FIVE_HOUR_UTIL")
+SEVEN_DAY_PCT=$(to_pct "$SEVEN_DAY_UTIL")
 
-# ---------- Format reset time ----------
-format_reset_time() {
-  local iso="$1"
+# ---------- Format reset time (from epoch seconds) ----------
+format_epoch_time() {
+  local epoch="$1"
   local format="$2"
-  [ -z "$iso" ] && echo "N/A" && return
-  local stripped="${iso%%Z*}"
-  stripped="${stripped%%+*}"
-  stripped="${stripped%%.*}"
-  local epoch
-  epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" "+%s" 2>/dev/null || \
-          date -d "${iso}" "+%s" 2>/dev/null || echo "")
-  [ -z "$epoch" ] && echo "N/A" && return
+  [ -z "$epoch" ] || [ "$epoch" = "0" ] && echo "" && return
   local result
   result=$(TZ="Asia/Tokyo" date -j -f "%s" "$epoch" "$format" 2>/dev/null || \
-           TZ="Asia/Tokyo" date -d "@${epoch}" "$format" 2>/dev/null || echo "N/A")
+           TZ="Asia/Tokyo" date -d "@${epoch}" "$format" 2>/dev/null || echo "")
   echo "$result" | sed 's/AM/am/;s/PM/pm/'
 }
 
 five_reset_display=""
-if [ -n "$FIVE_HOUR_RESET" ] && [ "$FIVE_HOUR_RESET" != "null" ]; then
-  five_reset_display="Resets $(format_reset_time "$FIVE_HOUR_RESET" "+%-I%p") (Asia/Tokyo)"
+if [ -n "$FIVE_HOUR_RESET" ] && [ "$FIVE_HOUR_RESET" != "0" ]; then
+  five_reset_display="Resets $(format_epoch_time "$FIVE_HOUR_RESET" "+%-I%p") (Asia/Tokyo)"
 fi
 
 seven_reset_display=""
-if [ -n "$SEVEN_DAY_RESET" ] && [ "$SEVEN_DAY_RESET" != "null" ]; then
-  seven_reset_display="Resets $(format_reset_time "$SEVEN_DAY_RESET" "+%b %-d at %-I%p") (Asia/Tokyo)"
+if [ -n "$SEVEN_DAY_RESET" ] && [ "$SEVEN_DAY_RESET" != "0" ]; then
+  seven_reset_display="Resets $(format_epoch_time "$SEVEN_DAY_RESET" "+%b %-d at %-I%p") (Asia/Tokyo)"
 fi
 
 # ---------- Format context used% ----------
@@ -204,11 +210,10 @@ fi
 
 # ---------- Line 2 (5h) ----------
 line2=""
-if [ -n "$FIVE_HOUR_PCT_DISPLAY" ]; then
-  pct_int_5h=$FIVE_HOUR_PCT_DISPLAY
-  c5=$(color_for_pct "$pct_int_5h")
-  bar5=$(progress_bar "$pct_int_5h")
-  line2="${c5}⏱ 5h  ${bar5}  ${pct_int_5h}%${RESET}"
+if [ -n "$FIVE_HOUR_PCT" ]; then
+  c5=$(color_for_pct "$FIVE_HOUR_PCT")
+  bar5=$(progress_bar "$FIVE_HOUR_PCT")
+  line2="${c5}⏱ 5h  ${bar5}  ${FIVE_HOUR_PCT}%${RESET}"
   [ -n "$five_reset_display" ] && line2+="  ${DIM}${five_reset_display}${RESET}"
 else
   line2="${GRAY}⏱ 5h  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
@@ -216,11 +221,10 @@ fi
 
 # ---------- Line 3 (7d) ----------
 line3=""
-if [ -n "$SEVEN_DAY_PCT_DISPLAY" ]; then
-  pct_int_7d=$SEVEN_DAY_PCT_DISPLAY
-  c7=$(color_for_pct "$pct_int_7d")
-  bar7=$(progress_bar "$pct_int_7d")
-  line3="${c7}📅 7d  ${bar7}  ${pct_int_7d}%${RESET}"
+if [ -n "$SEVEN_DAY_PCT" ]; then
+  c7=$(color_for_pct "$SEVEN_DAY_PCT")
+  bar7=$(progress_bar "$SEVEN_DAY_PCT")
+  line3="${c7}📅 7d  ${bar7}  ${SEVEN_DAY_PCT}%${RESET}"
   [ -n "$seven_reset_display" ] && line3+="  ${DIM}${seven_reset_display}${RESET}"
 else
   line3="${GRAY}📅 7d  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
