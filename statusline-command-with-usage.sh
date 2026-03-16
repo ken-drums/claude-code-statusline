@@ -248,6 +248,11 @@ else
   line3="${GRAY}📅 7d  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
 fi
 
+if [ -n "$cwd" ]; then
+  cwd_display="${cwd/#$HOME/~}"
+  line3+="${SEP}📁 ${DIM}${cwd_display}${RESET}"
+fi
+
 # ---------- Output ----------
 printf '%s\n' "$line1"
 printf '%s\n' "$line2"

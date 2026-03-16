@@ -147,12 +147,17 @@ if (( ctx_size > 0 )); then
   line2+="  ${DIM}${used_tokens_display} / ${ctx_size_display} tokens${RESET}"
 fi
 
-# ========== Line 3: Session cost ==========
+# ========== Line 3: Session cost | CWD ==========
 line3=""
 if [[ -n "$cost_display" ]]; then
   line3="${GREEN}💰 ${cost_display}${RESET}"
 else
   line3="${DIM}💰 --${RESET}"
+fi
+
+if [[ -n "$cwd" ]]; then
+  cwd_display="${cwd/#$HOME/~}"
+  line3+="${SEP}📁 ${DIM}${cwd_display}${RESET}"
 fi
 
 # ---------- Output ----------
