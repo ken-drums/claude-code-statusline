@@ -212,11 +212,44 @@ if [ -n "$used_pct" ] && [ "$used_pct" != "null" ] && [ "$used_pct" != "0" ]; th
   ctx_pct_int=$(printf "%.0f" "$used_pct" 2>/dev/null || echo 0)
 fi
 
+# ---------- Rate limit multiplier (JST schedule) ----------
+# 2x schedule: Mon 0-21, Tue-Fri 3-21, Sat 3-24, Sun all day
+# Returns "<mult> <window>" e.g. "2x 3:00-21:00"
+get_rate_info() {
+  local jst_dow jst_hour window
+  jst_dow=$(TZ=Asia/Tokyo date +%u 2>/dev/null) || jst_dow=0
+  jst_hour=$(TZ=Asia/Tokyo date +%-H 2>/dev/null) || jst_hour=0
+  jst_hour=$(( 10#${jst_hour:-0} ))
+  if (( jst_hour < 3 )); then
+    window="0:00-3:00"
+  elif (( jst_hour < 21 )); then
+    window="3:00-21:00"
+  else
+    window="21:00-24:00"
+  fi
+  case "$jst_dow" in
+    1)  (( jst_hour < 21 )) && echo "2x $window" || echo "1x $window" ;;
+    2|3|4|5)  (( jst_hour >= 3 && jst_hour < 21 )) && echo "2x $window" || echo "1x $window" ;;
+    6)  (( jst_hour >= 3 )) && echo "2x $window" || echo "1x $window" ;;
+    7)  echo "2x $window" ;;
+    *)  echo "1x $window" ;;
+  esac
+}
+rate_info=$(get_rate_info)
+rate_mult="${rate_info%% *}"
+rate_window="${rate_info#* }"
+
 # ---------- Line 1 ----------
 SEP="${GRAY} │ ${RESET}"
 ctx_color=$(color_for_pct "$ctx_pct_int")
 
-line1="🤖 ${model_name}${SEP}${ctx_color}📊 ${ctx_pct_int}%${RESET}"
+if [ "$rate_mult" = "2x" ]; then
+  rate_display="${YELLOW}⚡ 2x${RESET}${DIM} ${rate_window}${RESET}"
+else
+  rate_display="${GRAY}1x ${rate_window}${RESET}"
+fi
+
+line1="🤖 ${model_name}${SEP}${rate_display}${SEP}${ctx_color}📊 ${ctx_pct_int}%${RESET}"
 
 if [ -n "$git_stats" ]; then
   line1+="${SEP}✏️  ${GREEN}${git_stats}${RESET}"
@@ -248,12 +281,15 @@ else
   line3="${GRAY}📅 7d  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
 fi
 
+# ---------- Line 4 (cwd) ----------
+line4=""
 if [ -n "$cwd" ]; then
   cwd_display="${cwd/#$HOME/~}"
-  line3+="${SEP}📁 ${DIM}${cwd_display}${RESET}"
+  line4="📁 ${DIM}${cwd_display}${RESET}"
 fi
 
 # ---------- Output ----------
 printf '%s\n' "$line1"
 printf '%s\n' "$line2"
-printf '%s' "$line3"
+printf '%s\n' "$line3"
+printf '%s' "$line4"
